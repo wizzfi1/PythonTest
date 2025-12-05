@@ -1,30 +1,31 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
+
 from services.embeddings import EmbeddingService
 from services.vector_db import VectorDB
+from services.ocr_service import EasyOCRService
 from services.cnn_predict import CNNPredictor
-from services.hf_ocr import HFOCR      # Nougat OCR
-from services.ocr_service import OCRService   # Tesseract fallback
-from flask_cors import CORS
 
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# --- Initialize Services ---
+# -----------------------
+# INITIALIZE SERVICES
+# -----------------------
 embedder = EmbeddingService()
 db = VectorDB()
 
-hf_ocr = HFOCR()        # ⚡ New HuggingFace Nougat OCR
-ocr = OCRService()      # Fallback only
+ocr = EasyOCRService()      # 🔥 main OCR (EasyOCR headless)
+
 cnn = CNNPredictor(
     model_path="models/cnn_transfer.keras",
     class_json="models/class_names.json"
 )
 
-
 # --------------------------------------------------
-# MODULE 1 — TEXT PRODUCT RECOMMENDATION
+# MODULE 1 — PRODUCT RECOMMENDATION (TEXT SEARCH)
 # --------------------------------------------------
 @app.route('/product-recommendation', methods=['POST'])
 def product_recommendation():
@@ -36,8 +37,8 @@ def product_recommendation():
             "response": "Please provide a product query."
         })
 
-    query_vec = embedder.embed_text([query])[0]
-    results = db.query(query_vec, top_k=5)
+    vec = embedder.embed_text([query])[0]
+    results = db.query(vec, top_k=5)
 
     products = [{
         "id": m.id,
@@ -53,29 +54,23 @@ def product_recommendation():
 
 
 # --------------------------------------------------
-# MODULE 2 — OCR (HF Nougat → Tesseract fallback)
+# MODULE 2 — OCR + Product Search
 # --------------------------------------------------
 @app.route('/ocr-query', methods=['POST'])
 def ocr_query():
-    file = request.files.get("image_data")
+    image_file = request.files.get("image_data")
 
-    if file is None:
+    if image_file is None:
         return jsonify({
             "products": [],
             "response": "No image uploaded.",
             "extracted_text": ""
         })
 
-    # --- Try HuggingFace OCR First ---
-    file.seek(0)
-    extracted = hf_ocr.extract_text(file)
+    # Run EasyOCR
+    extracted_text = ocr.extract_text(image_file)
 
-    # If failed, fallback to Tesseract
-    if not extracted or len(extracted.strip()) < 2:
-        file.seek(0)
-        extracted = ocr.extract_text(file)
-
-    if not extracted or extracted.strip() == "":
+    if not extracted_text:
         return jsonify({
             "products": [],
             "response": "Could not extract readable text.",
@@ -83,7 +78,7 @@ def ocr_query():
         })
 
     # Vector DB search
-    vec = embedder.embed_text([extracted])[0]
+    vec = embedder.embed_text([extracted_text])[0]
     results = db.query(vec, top_k=5)
 
     products = [{
@@ -95,13 +90,13 @@ def ocr_query():
 
     return jsonify({
         "products": products,
-        "response": f"OCR text '{extracted}' matched these products.",
-        "extracted_text": extracted
+        "response": f"OCR text '{extracted_text}' matched these products.",
+        "extracted_text": extracted_text
     })
 
 
 # --------------------------------------------------
-# MODULE 3 — CNN IMAGE PRODUCT CLASSIFICATION
+# MODULE 3 — CNN Image Product Search
 # --------------------------------------------------
 @app.route('/image-product-search', methods=['POST'])
 def image_product_search():
@@ -117,9 +112,11 @@ def image_product_search():
     temp_path = "tmp_upload.jpg"
     file.save(temp_path)
 
+    # CNN predict
     prediction = cnn.predict(temp_path)
     predicted_class = prediction["class"]
 
+    # Search vectors
     vec = embedder.embed_text([predicted_class])[0]
     results = db.query(vec, top_k=5)
 
@@ -138,7 +135,7 @@ def image_product_search():
 
 
 # --------------------------------------------------
-# START SERVER
+# START APP
 # --------------------------------------------------
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
