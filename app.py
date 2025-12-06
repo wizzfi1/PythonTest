@@ -4,28 +4,24 @@ from flask_cors import CORS
 from services.embeddings import EmbeddingService
 from services.vector_db import VectorDB
 from services.ocr_service import EasyOCRService
-from services.cnn_predict import CNNPredictor
 
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# -----------------------
-# INITIALIZE SERVICES
-# -----------------------
+# --------------------------------------------------
+# INITIALIZE ONLY LIGHTWEIGHT SERVICES
+# --------------------------------------------------
 embedder = EmbeddingService()
 db = VectorDB()
+ocr = EasyOCRService()     # OCR that works in Codespaces
 
-ocr = EasyOCRService()      # 🔥 main OCR (EasyOCR headless)
+cnn = None                 # CNN is lazy-loaded later
 
-cnn = CNNPredictor(
-    model_path="models/cnn_transfer.keras",
-    class_json="models/class_names.json"
-)
 
 # --------------------------------------------------
-# MODULE 1 — PRODUCT RECOMMENDATION (TEXT SEARCH)
+# MODULE 1 — TEXT PRODUCT RECOMMENDATION
 # --------------------------------------------------
 @app.route('/product-recommendation', methods=['POST'])
 def product_recommendation():
@@ -37,15 +33,18 @@ def product_recommendation():
             "response": "Please provide a product query."
         })
 
-    vec = embedder.embed_text([query])[0]
-    results = db.query(vec, top_k=5)
+    query_vector = embedder.embed_text([query])[0]
+    results = db.query(query_vector, top_k=5)
 
-    products = [{
-        "id": m.id,
-        "score": float(m.score),
-        "product_name": m.metadata.get("product_name", ""),
-        "price": m.metadata.get("price", "")
-    } for m in results.matches]
+    products = [
+        {
+            "id": m.id,
+            "score": float(m.score),
+            "product_name": m.metadata.get("product_name", ""),
+            "price": m.metadata.get("price", "")
+        }
+        for m in results.matches
+    ]
 
     return jsonify({
         "products": products,
@@ -54,7 +53,7 @@ def product_recommendation():
 
 
 # --------------------------------------------------
-# MODULE 2 — OCR + Product Search
+# MODULE 2 — EASYOCR HANDWRITTEN OCR
 # --------------------------------------------------
 @app.route('/ocr-query', methods=['POST'])
 def ocr_query():
@@ -63,45 +62,56 @@ def ocr_query():
     if image_file is None:
         return jsonify({
             "products": [],
-            "response": "No image uploaded.",
-            "extracted_text": ""
+            "extracted_text": "",
+            "response": "No image uploaded."
         })
 
-    # Run EasyOCR
     extracted_text = ocr.extract_text(image_file)
 
-    if not extracted_text:
+    if not extracted_text or extracted_text.strip() == "":
         return jsonify({
             "products": [],
-            "response": "Could not extract readable text.",
-            "extracted_text": ""
+            "extracted_text": "",
+            "response": "Could not extract readable text."
         })
 
-    # Vector DB search
-    vec = embedder.embed_text([extracted_text])[0]
-    results = db.query(vec, top_k=5)
+    # Query Pinecone with extracted OCR text
+    query_vector = embedder.embed_text([extracted_text])[0]
+    results = db.query(query_vector, top_k=5)
 
-    products = [{
-        "id": m.id,
-        "score": float(m.score),
-        "product_name": m.metadata.get("product_name", ""),
-        "price": m.metadata.get("price", "")
-    } for m in results.matches]
+    products = [
+        {
+            "id": m.id,
+            "score": float(m.score),
+            "product_name": m.metadata.get("product_name", ""),
+            "price": m.metadata.get("price", "")
+        }
+        for m in results.matches
+    ]
 
     return jsonify({
         "products": products,
-        "response": f"OCR text '{extracted_text}' matched these products.",
-        "extracted_text": extracted_text
+        "extracted_text": extracted_text,
+        "response": f"OCR text '{extracted_text}' matched these products."
     })
 
 
 # --------------------------------------------------
-# MODULE 3 — CNN Image Product Search
+# MODULE 3 — LAZY LOADED CNN IMAGE CLASSIFICATION
 # --------------------------------------------------
 @app.route('/image-product-search', methods=['POST'])
 def image_product_search():
-    file = request.files.get("product_image")
+    global cnn
 
+    # Lazy-load CNN ONLY when endpoint is first used
+    if cnn is None:
+        from services.cnn_predict import CNNPredictor
+        cnn = CNNPredictor(
+            model_path="models/cnn_transfer.keras",
+            class_json="models/class_names.json"
+        )
+
+    file = request.files.get("product_image")
     if file is None:
         return jsonify({
             "class": "",
@@ -109,23 +119,27 @@ def image_product_search():
             "response": "No image uploaded."
         })
 
+    # Save temporary image
     temp_path = "tmp_upload.jpg"
     file.save(temp_path)
 
-    # CNN predict
+    # CNN prediction
     prediction = cnn.predict(temp_path)
     predicted_class = prediction["class"]
 
-    # Search vectors
-    vec = embedder.embed_text([predicted_class])[0]
-    results = db.query(vec, top_k=5)
+    # Search Pinecone for similar products
+    query_vector = embedder.embed_text([predicted_class])[0]
+    results = db.query(query_vector, top_k=5)
 
-    products = [{
-        "id": m.id,
-        "score": float(m.score),
-        "product_name": m.metadata.get("product_name", ""),
-        "price": m.metadata.get("price", "")
-    } for m in results.matches]
+    products = [
+        {
+            "id": m.id,
+            "score": float(m.score),
+            "product_name": m.metadata.get("product_name", ""),
+            "price": m.metadata.get("price", "")
+        }
+        for m in results.matches
+    ]
 
     return jsonify({
         "class": predicted_class,
@@ -134,8 +148,5 @@ def image_product_search():
     })
 
 
-# --------------------------------------------------
-# START APP
-# --------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=False)

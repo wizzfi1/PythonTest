@@ -1,23 +1,26 @@
 import easyocr
 import numpy as np
 from PIL import Image
+import io
 
 class EasyOCRService:
     def __init__(self):
-        # English + numerical handwriting support
-        self.reader = easyocr.Reader(['en'], gpu=False)
+        # English only, CPU only, no GPU issues
+        self.reader = easyocr.Reader(["en"], gpu=False)
 
     def extract_text(self, image_file):
-        """Extract handwritten text using EasyOCR."""
-        try:
-            image = Image.open(image_file).convert("RGB")
-            img_np = np.array(image)
+        """Extract text using EasyOCR from PIL or file upload."""
 
-            results = self.reader.readtext(img_np)
+        image_bytes = image_file.read()
+        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_arr = np.array(pil_img)
 
-            # Join detected text
-            extracted = " ".join([r[1] for r in results]).strip()
-            return extracted
-        except Exception as e:
-            print("EasyOCR error:", e)
+        results = self.reader.readtext(img_arr, detail=0)
+
+        if not results:
             return ""
+
+        # Join all OCR segments into one line
+        extracted = " ".join(results).strip()
+
+        return extracted
